@@ -1,0 +1,358 @@
+name: Build Windows x64 (CUDA + Vulkan + CPU)
+
+# Standalone, minimal workflow for the LSXAxeller/llama.cpp-adaptive-kv-streaming fork.
+# Builds ONLY Windows x64 binaries: CPU (full toolset with embedded web UI) +
+# CUDA 13.4 backend + Vulkan backend.
+# No macOS / Linux / Android / SYCL / OpenVINO / ROCm / Docker / release-publish machinery.
+#
+# Trigger: manual only (Actions tab -> "Build Windows x64" -> Run workflow).
+# Tick/untick the three booleans to choose which backends to build.
+# The CPU build is required if you want llama-server.exe (with embedded web UI)
+# injected into the CUDA/Vulkan zips.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_cpu:
+        description: 'Build CPU (llama-server + tools + ggml-cpu)'
+        required: true
+        type: boolean
+        default: true
+      build_cuda:
+        description: 'Build CUDA 13.4 backend (ggml-cuda.dll + cudart)'
+        required: true
+        type: boolean
+        default: true
+      build_vulkan:
+        description: 'Build Vulkan backend (ggml-vulkan.dll)'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Same env var the upstream release.yml uses for the CPU build.
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+concurrency:
+  group: build-win-x64
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 0: Build the embedded web UI (Node.js, runs on Ubuntu).
+  # Produces the llama-ui.zip artifact containing the built static assets.
+  # The CPU job downloads this into tools/ui/dist/ before cmake, and cmake embeds
+  # it into llama-server.exe via tools/ui/CMakeLists.txt.
+  # Mirrors .github/workflows/ui-build.yml from upstream, inlined here.
+  # Only runs when build_cpu is true (the CPU job is the only consumer).
+  # ---------------------------------------------------------------------------
+  ui-build:
+    name: Web UI (embedded)
+    if: ${{ inputs.build_cpu }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve UI version
+        id: version
+        run: |
+          version="b$(git rev-list --count HEAD)"
+          echo "ui_version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: tools/ui
+
+      - name: Build application
+        env:
+          LLAMA_BUILD_NUMBER: ${{ steps.version.outputs.ui_version }}
+        run: npm run build
+        working-directory: tools/ui
+
+      - name: Upload built UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-ui
+          path: tools/ui/dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # JOB 1: Windows CPU x64 — full toolset (llama-server with embedded web UI,
+  # llama-cli, ggml-cpu, ...).
+  # Produces llama-bin-win-cpu-x64.zip containing the complete bin/Release folder.
+  # This is the "base" zip; its binaries get injected into the CUDA + Vulkan zips
+  # by the final package job, exactly like the upstream release-publish step does.
+  # ---------------------------------------------------------------------------
+  win-cpu-x64:
+    name: CPU x64 (full toolset)
+    if: ${{ inputs.build_cpu }}
+    needs: [ui-build]
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui
+          path: tools/ui/dist
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: win-x64-cpu
+          evict-old-files: 1d
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Pack
+        shell: pwsh
+        run: 7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cpu-x64
+          path: llama-bin-win-cpu-x64.zip
+          archive: false
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Windows CUDA 13.4 x64 — builds ONLY ggml-cuda.dll + cudart runtime DLLs.
+  # No llama-server here; that's injected from JOB 1 by the package job.
+  # Uses the repo's own .github/actions/windows-setup-cuda composite action.
+  # ---------------------------------------------------------------------------
+  win-cuda-x64:
+    name: CUDA 13.4 x64 (ggml-cuda.dll)
+    if: ${{ inputs.build_cuda }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install CUDA Toolkit 13.4 (x64)
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.4'
+          cuda_arch: 'x64'
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: win-x64-cuda-13.4
+          evict-old-files: 1d
+
+      - name: Build ggml-cuda
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack ggml-cuda.dll
+        shell: pwsh
+        run: 7z a -snl llama-bin-win-cuda-13.4-x64.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Pack CUDA runtime DLLs
+        shell: pwsh
+        run: |
+          $dst = '.\build\bin\cudart\'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          # robocopy exit codes 0-7 are success; only 8+ are fatal.
+          # Reset $LASTEXITCODE so the step doesn't fail on "1 = files copied OK".
+          robocopy "${{ env.CUDA_PATH }}\bin"     $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          if ($LASTEXITCODE -ge 8) { throw "robocopy (bin) failed with exit code $LASTEXITCODE" }
+          robocopy "${{ env.CUDA_PATH }}\lib"     $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          if ($LASTEXITCODE -ge 8) { throw "robocopy (lib) failed with exit code $LASTEXITCODE" }
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          if ($LASTEXITCODE -ge 8) { throw "robocopy (bin\x64) failed with exit code $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+          7z a cudart-llama-bin-win-cuda-13.4-x64.zip $dst\*
+
+      - name: Upload ggml-cuda
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-x64
+          path: llama-bin-win-cuda-13.4-x64.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload cudart
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-x64-cudart
+          path: cudart-llama-bin-win-cuda-13.4-x64.zip
+          archive: false
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: Windows Vulkan x64 — builds ONLY ggml-vulkan.dll.
+  # No llama-server here; injected from JOB 1 by the package job.
+  # ---------------------------------------------------------------------------
+  win-vulkan-x64:
+    name: Vulkan x64 (ggml-vulkan.dll)
+    if: ${{ inputs.build_vulkan }}
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.357.0
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe `
+            -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: Build ggml-vulkan
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release --target ggml-vulkan
+
+      - name: Pack
+        shell: pwsh
+        run: 7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\ggml-vulkan.dll
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-vulkan-x64
+          path: llama-bin-win-vulkan-x64.zip
+          archive: false
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # JOB 4: Merge — injects the CPU binaries (llama-server, ggml-cpu, ...) into
+  # each backend zip, so every final zip is a self-contained runnable package.
+  # Skips cleanly if a backend wasn't built (its dispatch input was false).
+  # ---------------------------------------------------------------------------
+  package:
+    name: Merge + final artifacts
+    needs: [ui-build, win-cpu-x64, win-cuda-x64, win-vulkan-x64]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifact
+          merge-multiple: false
+
+      - name: Inspect downloads
+        run: |
+          set -eux
+          find artifact -type f | sort
+
+      - name: Merge CPU binaries into backend zips
+        run: |
+          set -eux
+          mkdir -p release
+
+          CPU_ZIP=""
+          for f in artifact/win-cpu-x64/*.zip; do
+            [ -e "$f" ] && CPU_ZIP="$f" && break
+          done
+
+          if [ -z "$CPU_ZIP" ]; then
+            echo "No CPU build (build_cpu was false or failed) - copying backend zips as-is."
+            # Copy any backend zips straight through, with clean final names.
+            for f in artifact/win-cuda-x64/llama-bin-win-cuda-*.zip; do
+              [ -e "$f" ] && cp "$f" release/llama-bin-win-cuda-13.4-x64.zip || true
+            done
+            for f in artifact/win-vulkan-x64/llama-bin-win-vulkan-*.zip; do
+              [ -e "$f" ] && cp "$f" release/llama-bin-win-vulkan-x64.zip || true
+            done
+          else
+            echo "Merging CPU binaries from $CPU_ZIP into backend zips."
+            tmp="$(mktemp -d)"
+            unzip -q "$CPU_ZIP" -d "$tmp"
+
+            # CPU-only zip (useful on its own).
+            cp "$CPU_ZIP" release/llama-bin-win-cpu-x64.zip
+
+            # CUDA zip: ggml-cuda.dll + full CPU toolset.
+            for f in artifact/win-cuda-x64/llama-bin-win-cuda-*.zip; do
+              [ -e "$f" ] || continue
+              ( cd "$tmp" && zip -q -r "$PWD/$f" . )
+              cp "$f" release/llama-bin-win-cuda-13.4-x64.zip
+            done
+
+            # Vulkan zip: ggml-vulkan.dll + full CPU toolset.
+            for f in artifact/win-vulkan-x64/llama-bin-win-vulkan-*.zip; do
+              [ -e "$f" ] || continue
+              ( cd "$tmp" && zip -q -r "$PWD/$f" . )
+              cp "$f" release/llama-bin-win-vulkan-x64.zip
+            done
+          fi
+
+          # cudart zip is always copied as-is (drop next to the exe at runtime).
+          for f in artifact/win-cuda-x64-cudart/cudart-*.zip; do
+            [ -e "$f" ] && cp "$f" release/ || true
+          done
+
+          echo "=== final release/ contents ==="
+          ls -la release/
+
+      - name: Upload final bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-bin-win-x64-bundle
+          path: release/*
+          archive: false
+          if-no-files-found: error
