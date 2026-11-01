@@ -7,8 +7,14 @@ name: Build Windows x64 (CUDA + Vulkan + CPU)
 #
 # Trigger: manual only (Actions tab -> "Build Windows x64" -> Run workflow).
 # Tick/untick the three booleans to choose which backends to build.
-# The CPU build is required if you want llama-server.exe (with embedded web UI)
-# injected into the CUDA/Vulkan zips.
+#
+# ARTIFACT REUSE:
+#   By default, if the previous run of this workflow succeeded and produced
+#   a backend's artifact, that artifact is re-downloaded and re-uploaded into
+#   the current run (cheap, ~30s on Ubuntu) instead of rebuilding from scratch
+#   (~10 min on Windows). This lets you iterate on one backend without paying
+#   the build cost for the others you haven't touched.
+#   Tick "force_rebuild" to bypass reuse and rebuild everything from scratch.
 
 on:
   workflow_dispatch:
@@ -28,9 +34,15 @@ on:
         required: true
         type: boolean
         default: true
+      force_rebuild:
+        description: 'Force rebuild — ignore reusable artifacts from previous runs'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read   # needed to list previous workflow runs and download their artifacts
 
 # Same env var the upstream release.yml uses for the CPU build.
 env:
@@ -42,16 +54,70 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # JOB 0: Build the embedded web UI (Node.js, runs on Ubuntu).
-  # Produces the llama-ui.zip artifact containing the built static assets.
-  # The CPU job downloads this into tools/ui/dist/ before cmake, and cmake embeds
-  # it into llama-server.exe via tools/ui/CMakeLists.txt.
-  # Mirrors .github/workflows/ui-build.yml from upstream, inlined here.
-  # Only runs when build_cpu is true (the CPU job is the only consumer).
+  # JOB 0: Preflight — find the last successful run of this workflow and check
+  # which backend artifacts it produced. Sets outputs that gate the reuse vs.
+  # build decision for each backend below.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Preflight (reuse check)
+    runs-on: ubuntu-latest
+    outputs:
+      prev_run_id:      ${{ steps.find.outputs.prev_run_id }}
+      reuse_cuda:       ${{ steps.check.outputs.reuse_cuda }}
+      reuse_cudart:     ${{ steps.check.outputs.reuse_cudart }}
+      reuse_vulkan:     ${{ steps.check.outputs.reuse_vulkan }}
+
+    steps:
+      - name: Find last successful run
+        id: find
+        if: ${{ inputs.force_rebuild != true }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: context.workflow,
+              status: 'success',
+              per_page: 10
+            });
+            // Exclude the current run.
+            const prev = runs.data.workflow_runs.find(r => r.id !== context.runId);
+            if (prev) {
+              core.setOutput('prev_run_id', prev.id);
+              core.info(`Previous successful run: ${prev.html_url}`);
+              core.info(`  commit: ${prev.head_sha?.slice(0,12) ?? '?'}`);
+              core.info(`  branch: ${prev.head_branch}`);
+            } else {
+              core.info('No previous successful run found.');
+            }
+
+      - name: Check available artifacts in previous run
+        id: check
+        if: ${{ steps.find.outputs.prev_run_id != '' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const runId = Number('${{ steps.find.outputs.prev_run_id }}');
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+            const names = arts.data.artifacts.map(a => a.name);
+            core.info(`Artifacts in run ${runId}: ${names.join(', ') || '(none)'}`);
+            core.setOutput('reuse_cuda',   String(names.includes('win-cuda-x64')));
+            core.setOutput('reuse_cudart', String(names.includes('win-cuda-x64-cudart')));
+            core.setOutput('reuse_vulkan', String(names.includes('win-vulkan-x64')));
+
+  # ---------------------------------------------------------------------------
+  # JOB 0a: Build the embedded web UI (Node.js, runs on Ubuntu).
+  # Only runs when build_cpu is true AND CPU is not being reused from a prev run.
   # ---------------------------------------------------------------------------
   ui-build:
     name: Web UI (embedded)
     if: ${{ inputs.build_cpu }}
+    needs: [preflight]
     runs-on: ubuntu-latest
 
     steps:
@@ -90,17 +156,18 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ===========================================================================
+  # CPU PATH (always builds fresh — this is the path most commonly iterated on)
+  # ===========================================================================
+
   # ---------------------------------------------------------------------------
   # JOB 1: Windows CPU x64 — full toolset (llama-server with embedded web UI,
   # llama-cli, ggml-cpu, ...).
-  # Produces llama-bin-win-cpu-x64.zip containing the complete bin/Release folder.
-  # This is the "base" zip; its binaries get injected into the CUDA + Vulkan zips
-  # by the final package job, exactly like the upstream release-publish step does.
   # ---------------------------------------------------------------------------
   win-cpu-x64:
     name: CPU x64 (full toolset)
     if: ${{ inputs.build_cpu }}
-    needs: [ui-build]
+    needs: [preflight, ui-build]
     runs-on: windows-2025-vs2026
 
     steps:
@@ -114,6 +181,27 @@ jobs:
         with:
           name: llama-ui
           path: tools/ui/dist
+
+      - name: Patch fork symbol-export bugs (idempotent)
+        # The fork's src/llama-context-memory.h declares several methods WITHOUT
+        # the LLAMA_API export macro, so they don't cross the llama.dll boundary
+        # on Windows shared builds. Only borrows_serial_parent() is referenced
+        # from tools/server today, so that's the one that breaks the link.
+        # This step adds LLAMA_API to the declaration if (and only if) it's
+        # missing. Once the source is fixed upstream/in-fork, this becomes a no-op.
+        shell: pwsh
+        run: |
+          $f = 'src/llama-context-memory.h'
+          if (-not (Test-Path $f)) { Write-Host "File not found: $f — skipping patch"; exit 0 }
+          $content = Get-Content $f -Raw
+          $pattern = '(?m)(^\s+)bool borrows_serial_parent\(\) const noexcept;'
+          if ($content -match $pattern) {
+              $patched = $content -replace $pattern, '$1LLAMA_API bool borrows_serial_parent() const noexcept;'
+              Set-Content $f -Value $patched -NoNewline
+              Write-Host "Patched: added LLAMA_API to borrows_serial_parent() in $f"
+          } else {
+              Write-Host "No patch needed — LLAMA_API already present (or pattern changed)."
+          }
 
       - name: Install Ninja
         run: choco install ninja --no-progress
@@ -151,14 +239,71 @@ jobs:
           archive: false
           if-no-files-found: error
 
+  # ===========================================================================
+  # CUDA PATH — two mutually exclusive jobs:
+  #   reuse-cuda-x64  : if previous run has the artifact, re-download + re-upload (cheap)
+  #   win-cuda-x64    : else build from scratch (~10 min)
+  # Both produce the same artifacts (win-cuda-x64, win-cuda-x64-cudart), so the
+  # package job downstream doesn't care which one ran.
+  # ===========================================================================
+
   # ---------------------------------------------------------------------------
-  # JOB 2: Windows CUDA 13.4 x64 — builds ONLY ggml-cuda.dll + cudart runtime DLLs.
-  # No llama-server here; that's injected from JOB 1 by the package job.
-  # Uses the repo's own .github/actions/windows-setup-cuda composite action.
+  # JOB 2a: Reuse CUDA artifacts from previous successful run
+  # ---------------------------------------------------------------------------
+  reuse-cuda-x64:
+    name: CUDA 13.4 x64 (reuse from prev run)
+    if: ${{ inputs.build_cuda && needs.preflight.outputs.reuse_cuda == 'true' }}
+    needs: [preflight]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download ggml-cuda artifact from previous run
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ needs.preflight.outputs.prev_run_id }}
+          name: win-cuda-x64
+          path: ./cuda
+          github-token: ${{ github.token }}
+
+      - name: Download cudart artifact from previous run
+        if: ${{ needs.preflight.outputs.reuse_cudart == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ needs.preflight.outputs.prev_run_id }}
+          name: win-cuda-x64-cudart
+          path: ./cudart
+          github-token: ${{ github.token }}
+
+      - name: Re-upload ggml-cuda in current run
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-x64
+          path: ./cuda/*
+          archive: false
+          if-no-files-found: error
+
+      - name: Re-upload cudart in current run
+        if: ${{ needs.preflight.outputs.reuse_cudart == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-x64-cudart
+          path: ./cudart/*
+          archive: false
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "Reused CUDA artifacts from run ${{ needs.preflight.outputs.prev_run_id }}"
+          echo "  ggml-cuda:  $([ -f ./cuda/llama-bin-win-cuda-13.4-x64.zip ] && echo 'yes' || echo 'NO')"
+          echo "  cudart:     $([ -f ./cudart/cudart-llama-bin-win-cuda-13.4-x64.zip ] && echo 'yes' || echo 'no (will not be present in final bundle)')"
+
+  # ---------------------------------------------------------------------------
+  # JOB 2b: Build CUDA 13.4 x64 from scratch
   # ---------------------------------------------------------------------------
   win-cuda-x64:
-    name: CUDA 13.4 x64 (ggml-cuda.dll)
-    if: ${{ inputs.build_cuda }}
+    name: CUDA 13.4 x64 (build)
+    if: ${{ inputs.build_cuda && needs.preflight.outputs.reuse_cuda != 'true' }}
+    needs: [preflight]
     runs-on: windows-2022
 
     steps:
@@ -189,10 +334,10 @@ jobs:
             -DGGML_NATIVE=OFF ^
             -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=OFF ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CCCL_VERSION=v3.4.3
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
@@ -232,13 +377,48 @@ jobs:
           archive: false
           if-no-files-found: error
 
+  # ===========================================================================
+  # VULKAN PATH — same reuse-or-build pattern as CUDA
+  # ===========================================================================
+
   # ---------------------------------------------------------------------------
-  # JOB 3: Windows Vulkan x64 — builds ONLY ggml-vulkan.dll.
-  # No llama-server here; injected from JOB 1 by the package job.
+  # JOB 3a: Reuse Vulkan artifact from previous successful run
+  # ---------------------------------------------------------------------------
+  reuse-vulkan-x64:
+    name: Vulkan x64 (reuse from prev run)
+    if: ${{ inputs.build_vulkan && needs.preflight.outputs.reuse_vulkan == 'true' }}
+    needs: [preflight]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download ggml-vulkan artifact from previous run
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ needs.preflight.outputs.prev_run_id }}
+          name: win-vulkan-x64
+          path: ./vulkan
+          github-token: ${{ github.token }}
+
+      - name: Re-upload in current run
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-vulkan-x64
+          path: ./vulkan/*
+          archive: false
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "Reused Vulkan artifact from run ${{ needs.preflight.outputs.prev_run_id }}"
+          ls -la ./vulkan/
+
+  # ---------------------------------------------------------------------------
+  # JOB 3b: Build Vulkan x64 from scratch
   # ---------------------------------------------------------------------------
   win-vulkan-x64:
-    name: Vulkan x64 (ggml-vulkan.dll)
-    if: ${{ inputs.build_vulkan }}
+    name: Vulkan x64 (build)
+    if: ${{ inputs.build_vulkan && needs.preflight.outputs.reuse_vulkan != 'true' }}
+    needs: [preflight]
     runs-on: windows-2025
 
     env:
@@ -263,7 +443,14 @@ jobs:
       - name: Build ggml-vulkan
         shell: pwsh
         run: |
-          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake -S . -B build `
+            -DGGML_VULKAN=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF
           cmake --build build --config Release --target ggml-vulkan
 
       - name: Pack
@@ -285,7 +472,7 @@ jobs:
   # ---------------------------------------------------------------------------
   package:
     name: Merge + final artifacts
-    needs: [ui-build, win-cpu-x64, win-cuda-x64, win-vulkan-x64]
+    needs: [preflight, win-cpu-x64, win-cuda-x64, reuse-cuda-x64, win-vulkan-x64, reuse-vulkan-x64]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
 
@@ -313,7 +500,6 @@ jobs:
 
           if [ -z "$CPU_ZIP" ]; then
             echo "No CPU build (build_cpu was false or failed) - copying backend zips as-is."
-            # Copy any backend zips straight through, with clean final names.
             for f in artifact/win-cuda-x64/llama-bin-win-cuda-*.zip; do
               [ -e "$f" ] && cp "$f" release/llama-bin-win-cuda-13.4-x64.zip || true
             done
@@ -325,17 +511,14 @@ jobs:
             tmp="$(mktemp -d)"
             unzip -q "$CPU_ZIP" -d "$tmp"
 
-            # CPU-only zip (useful on its own).
             cp "$CPU_ZIP" release/llama-bin-win-cpu-x64.zip
 
-            # CUDA zip: ggml-cuda.dll + full CPU toolset.
             for f in artifact/win-cuda-x64/llama-bin-win-cuda-*.zip; do
               [ -e "$f" ] || continue
               ( cd "$tmp" && zip -q -r "$PWD/$f" . )
               cp "$f" release/llama-bin-win-cuda-13.4-x64.zip
             done
 
-            # Vulkan zip: ggml-vulkan.dll + full CPU toolset.
             for f in artifact/win-vulkan-x64/llama-bin-win-vulkan-*.zip; do
               [ -e "$f" ] || continue
               ( cd "$tmp" && zip -q -r "$PWD/$f" . )
@@ -343,7 +526,6 @@ jobs:
             done
           fi
 
-          # cudart zip is always copied as-is (drop next to the exe at runtime).
           for f in artifact/win-cuda-x64-cudart/cudart-*.zip; do
             [ -e "$f" ] && cp "$f" release/ || true
           done
